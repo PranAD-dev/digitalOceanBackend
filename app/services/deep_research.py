@@ -13,14 +13,47 @@ class DeepResearchError(Exception):
 def extract_json(text: str) -> str:
     """Extract JSON from text that may contain markdown code blocks or extra content"""
     # Remove markdown code blocks if present
-    text = re.sub(r'^```(?:json)?\s*', '', text.strip())
-    text = re.sub(r'\s*```$', '', text.strip())
+    text = re.sub(r'```(?:json)?\s*', '', text.strip())
+    text = re.sub(r'\s*```', '', text.strip())
 
-    # Find JSON object boundaries
+    # Find the first opening brace
     start = text.find('{')
-    end = text.rfind('}')
+    if start == -1:
+        return text
 
-    if start != -1 and end != -1:
+    # Track brace depth to find matching closing brace
+    depth = 0
+    in_string = False
+    escape_next = False
+    end = start
+
+    for i in range(start, len(text)):
+        char = text[i]
+
+        if escape_next:
+            escape_next = False
+            continue
+
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+
+        if char == '"' and not escape_next:
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+
+    if depth == 0 and end > start:
         return text[start:end + 1]
 
     return text
