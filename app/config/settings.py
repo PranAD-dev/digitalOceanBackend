@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     # Tavily Search API
     tavily_api_key: str
 
+    # Anthropic Claude API
+    anthropic_api_key: str
+
     # CORS Origins (comma-separated for multiple origins)
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
 

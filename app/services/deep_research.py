@@ -1,6 +1,5 @@
 import httpx
 import json
-import re
 
 from app.config import settings
 
@@ -10,59 +9,69 @@ class DeepResearchError(Exception):
     pass
 
 
-def extract_json(text: str) -> str:
-    """Extract JSON from text that may contain markdown code blocks or extra content"""
-    text = re.sub(r'```(?:json)?\s*', '', text.strip())
-    text = re.sub(r'\s*```', '', text.strip())
+async def extract_json_with_claude(text: str) -> dict:
+    """Use Claude API to extract and format JSON from unstructured text"""
+    headers = {
+        "x-api-key": settings.anthropic_api_key,
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01"
+    }
 
-    # Find the first opening brace
-    start = text.find('{')
-    if start == -1:
-        return text
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 8192,
+        "messages": [
+            {
+                "role": "user",
+                "content": f"""Extract the JSON object from the following text and return ONLY the valid JSON, nothing else.
+Do not include any markdown code blocks, explanations, or extra text. Just the raw JSON object.
 
-    # Track brace depth to find matching closing brace
-    depth = 0
-    in_string = False
-    escape_next = False
-    end = start
+Text:
+{text}"""
+            }
+        ]
+    }
 
-    for i in range(start, len(text)):
-        char = text[i]
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload
+        )
 
-        if escape_next:
-            escape_next = False
-            continue
+        if response.status_code != 200:
+            raise DeepResearchError(f"Claude API error: {response.status_code} - {response.text}")
+        print("/n/n/n/n")
+        print(response.content)
+        print("/n/n/n/n")
+        result = response.json()
+        content = result.get("content", [{}])[0].get("text", "")
 
-        if char == '\\' and in_string:
-            escape_next = True
-            continue
+        # Strip markdown code blocks if present
+        content = content.strip()
+        if content.startswith("```json"):
+            content = content[7:]  # Remove ```json
+        elif content.startswith("```"):
+            content = content[3:]  # Remove ```
+        if content.endswith("```"):
+            content = content[:-3]  # Remove trailing ```
+        content = content.strip()
 
-        if char == '"' and not escape_next:
-            in_string = not in_string
-            continue
-
-        if in_string:
-            continue
-
-        if char == '{':
-            depth += 1
-        elif char == '}':
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
-
-    if depth == 0 and end > start:
-        return text[start:end + 1]
-
-    return text
+        # Parse the cleaned JSON
+        return json.loads(content)
 
 
 class DeepResearchService:
     def __init__(self):
         self.api_key = settings.deep_agent_key
         self.api_url = settings.deep_endpoint
-        self.timeout = 120.0  # Longer timeout for deep research
+        # Use granular timeouts for streaming: longer read timeout for slow responses
+        self.timeout = httpx.Timeout(
+            connect=30.0,    # Time to establish connection
+            read=300.0,      # Time to wait for data (5 min for slow AI responses)
+            write=30.0,      # Time to send request
+            pool=30.0        # Time to acquire connection from pool
+        )
 
     async def question_analyze(self, ticker: str) -> dict:
         """
@@ -81,35 +90,38 @@ class DeepResearchService:
                     "content": ticker.upper()
                 }
             ],
-            "stream": False,
-            "include_functions_info": True,
-            "include_retrieval_info": True,
+            "stream": True,
+            "include_functions_info": False,
+            "include_retrieval_info": False,
             "include_guardrails_info": False
         }
 
+        full_content = ""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 f"{self.api_url}/api/v1/chat/completions",
                 headers=headers,
                 json=payload
-            )
+            ) as response:
+                if response.status_code != 200:
+                    await response.aread()
+                    raise DeepResearchError(f"API returned status {response.status_code}: {response.text}")
 
-            if response.status_code != 200:
-                raise DeepResearchError(f"API returned status {response.status_code}")
-
-            data = response.json()
-
-        # Extract and parse JSON from the response
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix
+                        if data_str.strip() == "[DONE]":
+                            break
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        if "content" in delta:
+                            full_content += delta["content"]
+        # Use Claude to extract and format JSON from the response
         try:
-            content = data["choices"][0]["message"]["content"]
-            clean_json = extract_json(content)
-            try:
-                return json.loads(clean_json)
-            except json.JSONDecodeError:
-                # If JSON parsing fails, return raw content with error info
-                return {"raw_content": content, "parse_error": "Could not extract valid JSON from response"}
-        except KeyError as e:
-            raise DeepResearchError(f"Invalid response structure: {e}")
+            return await extract_json_with_claude(full_content)
+        except json.JSONDecodeError as e:
+            raise DeepResearchError(f"Failed to parse JSON from response: {e}")
 
     async def deep_analyze(self, ticker: str) -> dict:
         """
@@ -128,41 +140,39 @@ class DeepResearchService:
                     "content": ticker.upper()
                 }
             ],
-            "stream": False,
-            "include_functions_info": True,
-            "include_retrieval_info": True,
+            "stream": True,
+            "include_functions_info": False,
+            "include_retrieval_info": False,
             "include_guardrails_info": False
         }
 
+        full_content = ""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 f"{self.api_url}/api/v1/chat/completions",
                 headers=headers,
                 json=payload
-            )
+            ) as response:
+                if response.status_code != 200:
+                    await response.aread()
+                    raise DeepResearchError(f"API returned status {response.status_code}: {response.text}")
 
-            if response.status_code != 200:
-                raise DeepResearchError(f"API returned status {response.status_code}")
-
-            data = response.json()
-
-        return self._parse_response(data)
-
-    def _parse_response(self, data: dict) -> dict:
-        """Parse the raw API response"""
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        if "content" in delta:
+                            full_content += delta["content"]
+        print(full_content)
+        # Use Claude to extract and format JSON from the response
         try:
-            content = data["choices"][0]["message"]["content"]
-            # Try to parse as JSON first
-            clean_json = extract_json(content)
-            try:
-                return json.loads(clean_json)
-            except json.JSONDecodeError:
-                # If not valid JSON, return as text content
-                return {"content": content, "format": "text"}
-        except KeyError as e:
-            raise DeepResearchError(f"Invalid response structure: {e}")
-        except Exception as e:
-            raise DeepResearchError(f"Error parsing response: {e}")
+            return await extract_json_with_claude(full_content)
+        except json.JSONDecodeError as e:
+            raise DeepResearchError(f"Failed to parse JSON from response: {e}")
 
 
 # Singleton instance
