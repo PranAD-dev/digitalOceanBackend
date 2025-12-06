@@ -1,0 +1,90 @@
+import httpx
+import json
+import re
+
+from app.config import settings
+
+
+class DeepResearchError(Exception):
+    """Custom exception for deep research errors"""
+    pass
+
+
+def extract_json(text: str) -> str:
+    """Extract JSON from text that may contain markdown code blocks or extra content"""
+    # Remove markdown code blocks if present
+    text = re.sub(r'^```(?:json)?\s*', '', text.strip())
+    text = re.sub(r'\s*```$', '', text.strip())
+
+    # Find JSON object boundaries
+    start = text.find('{')
+    end = text.rfind('}')
+
+    if start != -1 and end != -1:
+        return text[start:end + 1]
+
+    return text
+
+
+class DeepResearchService:
+    def __init__(self):
+        self.api_key = settings.deep_agent_key
+        self.api_url = settings.deep_endpoint
+        self.timeout = 120.0  # Longer timeout for deep research
+
+    async def deep_analyze(self, ticker: str) -> dict:
+        """
+        Send a stock ticker to the Deep Research agent for comprehensive analysis.
+        Returns the parsed response.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": ticker.upper()
+                }
+            ],
+            "stream": False,
+            "include_functions_info": True,
+            "include_retrieval_info": True,
+            "include_guardrails_info": False
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.api_url}/api/v1/chat/completions",
+                headers=headers,
+                json=payload
+            )
+
+            if response.status_code != 200:
+                raise DeepResearchError(f"API returned status {response.status_code}")
+
+            data = response.json()
+
+        return self._parse_response(data)
+
+    def _parse_response(self, data: dict) -> dict:
+        """Parse the raw API response"""
+        try:
+            content = data["choices"][0]["message"]["content"]
+            # Try to parse as JSON first
+            clean_json = extract_json(content)
+            try:
+                return json.loads(clean_json)
+            except json.JSONDecodeError:
+                # If not valid JSON, return as text content
+                return {"content": content, "format": "text"}
+        except KeyError as e:
+            raise DeepResearchError(f"Invalid response structure: {e}")
+        except Exception as e:
+            raise DeepResearchError(f"Error parsing response: {e}")
+
+
+# Singleton instance
+deep_research_service = DeepResearchService()
