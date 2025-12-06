@@ -12,7 +12,6 @@ class DeepResearchError(Exception):
 
 def extract_json(text: str) -> str:
     """Extract JSON from text that may contain markdown code blocks or extra content"""
-    # Remove markdown code blocks if present
     text = re.sub(r'```(?:json)?\s*', '', text.strip())
     text = re.sub(r'\s*```', '', text.strip())
 
@@ -64,6 +63,53 @@ class DeepResearchService:
         self.api_key = settings.deep_agent_key
         self.api_url = settings.deep_endpoint
         self.timeout = 120.0  # Longer timeout for deep research
+
+    async def question_analyze(self, ticker: str) -> dict:
+        """
+        Send a stock ticker to get analysis content.
+        Extracts and returns parsed JSON from the response.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": ticker.upper()
+                }
+            ],
+            "stream": False,
+            "include_functions_info": True,
+            "include_retrieval_info": True,
+            "include_guardrails_info": False
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.api_url}/api/v1/chat/completions",
+                headers=headers,
+                json=payload
+            )
+
+            if response.status_code != 200:
+                raise DeepResearchError(f"API returned status {response.status_code}")
+
+            data = response.json()
+
+        # Extract and parse JSON from the response
+        try:
+            content = data["choices"][0]["message"]["content"]
+            clean_json = extract_json(content)
+            try:
+                return json.loads(clean_json)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, return raw content with error info
+                return {"raw_content": content, "parse_error": "Could not extract valid JSON from response"}
+        except KeyError as e:
+            raise DeepResearchError(f"Invalid response structure: {e}")
 
     async def deep_analyze(self, ticker: str) -> dict:
         """
