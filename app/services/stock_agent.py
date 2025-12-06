@@ -7,37 +7,62 @@ from app.models.stock import StockAnalysisResponse
 
 
 class StockAgentError(Exception):
-    """Custom exception for stock agent errors"""
     pass
 
 
-def extract_json(text: str) -> str:
-    """Extract JSON from text that may contain markdown code blocks or extra content"""
-    # Remove markdown code blocks if present
+def fix_json(text: str) -> str:
     text = re.sub(r'^```(?:json)?\s*', '', text.strip())
     text = re.sub(r'\s*```$', '', text.strip())
 
-    # Find JSON object boundaries
     start = text.find('{')
     end = text.rfind('}')
 
     if start != -1 and end != -1:
-        return text[start:end + 1]
+        text = text[start:end + 1]
+
+    text = re.sub(r',\s*}', '}', text)
+    text = re.sub(r',\s*]', ']', text)
 
     return text
+
+
+def safe_parse(parsed: dict) -> dict:
+    defaults = {
+        "ticker": parsed.get("ticker", "UNKNOWN"),
+        "current_price": parsed.get("current_price"),
+        "verdict": parsed.get("verdict", "NEUTRAL"),
+        "confidence_score": min(max(int(parsed.get("confidence_score", 50)), 0), 100),
+        "executive_summary": parsed.get("executive_summary", "Analysis unavailable."),
+        "fundamentals": parsed.get("fundamentals", {
+            "valuation_rating": "FAIR",
+            "health_check": "Data unavailable."
+        }),
+        "catalysts": parsed.get("catalysts", []),
+        "red_flags": parsed.get("red_flags", [])
+    }
+
+    if isinstance(defaults["fundamentals"], dict):
+        defaults["fundamentals"]["valuation_rating"] = defaults["fundamentals"].get("valuation_rating", "FAIR")
+        defaults["fundamentals"]["health_check"] = defaults["fundamentals"].get("health_check", "Data unavailable.")
+
+    valid_verdicts = ["BUY", "SELL", "NEUTRAL"]
+    if defaults["verdict"] not in valid_verdicts:
+        defaults["verdict"] = "NEUTRAL"
+
+    valid_ratings = ["OVERVALUED", "UNDERVALUED", "FAIR"]
+    if defaults["fundamentals"].get("valuation_rating") not in valid_ratings:
+        defaults["fundamentals"]["valuation_rating"] = "FAIR"
+
+    return defaults
 
 
 class StockAgentService:
     def __init__(self):
         self.api_key = settings.stock_agent_key
         self.api_url = settings.agent_endpoint
-        self.timeout = 60.0
+        self.timeout = 90.0
 
     async def analyze_stock(self, ticker: str) -> StockAnalysisResponse:
-        """
-        Send a stock ticker to the DigitalOcean GenAI agent for analysis.
-        Returns a parsed StockAnalysisResponse.
-        """
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -56,35 +81,35 @@ class StockAgentService:
             "include_guardrails_info": False
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.api_url}/api/v1/chat/completions",
-                headers=headers,
-                json=payload
-            )
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.api_url}/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload
+                )
 
-            if response.status_code != 200:
-                raise StockAgentError(f"API returned status {response.status_code}")
+                if response.status_code != 200:
+                    raise StockAgentError(f"API returned status {response.status_code}")
 
-            data = response.json()
+                data = response.json()
+        except httpx.TimeoutException:
+            raise StockAgentError("Request timed out")
+        except httpx.RequestError as e:
+            raise StockAgentError(f"Request failed: {e}")
 
-        return self._parse_response(data)
+        return self._parse_response(data, ticker)
 
-    def _parse_response(self, data: dict) -> StockAnalysisResponse:
-        """Parse the raw API response into a StockAnalysisResponse"""
+    def _parse_response(self, data: dict, ticker: str) -> StockAnalysisResponse:
         try:
             content = data["choices"][0]["message"]["content"]
-            # Clean up the content to extract valid JSON
-            clean_json = extract_json(content)
+            clean_json = fix_json(content)
             parsed = json.loads(clean_json)
-            return StockAnalysisResponse(**parsed)
-        except KeyError as e:
-            raise StockAgentError(f"Invalid response structure: {e}")
-        except json.JSONDecodeError as e:
-            raise StockAgentError(f"Failed to parse JSON content: {e}")
-        except Exception as e:
-            raise StockAgentError(f"Error parsing response: {e}")
+            safe_data = safe_parse(parsed)
+            safe_data["ticker"] = ticker.upper()
+            return StockAnalysisResponse(**safe_data)
+        except (KeyError, json.JSONDecodeError, TypeError) as e:
+            raise StockAgentError(f"Failed to parse response: {e}")
 
 
-# Singleton instance
 stock_agent_service = StockAgentService()
