@@ -2,8 +2,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import uvicorn
+import sentry_sdk
 
 from app.config import settings
+
+sentry_sdk.init(
+    dsn="https://o4510489906315264.ingest.us.sentry.io/4510489907625984",
+    send_default_pii=True,
+    traces_sample_rate=1.0,
+)
 from app.routes import stock_router, health_router, deep_research_router, tavily_router
 
 
